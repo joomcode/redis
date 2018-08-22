@@ -3761,6 +3761,83 @@ static int clusterManagerFixOpenSlot(int slot) {
     }
     printf("Set as migrating in: %s\n", migrating_str);
     printf("Set as importing in: %s\n", importing_str);
+    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
+    /* Common case: The slot is in migrating state in one slot, and in
+     *         importing state in 1 slot. That's trivial to address. */
+    if (listLength(migrating) == 1 && listLength(importing) == 1 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value == listFirst(migrating)->value) {
+        clusterManagerNode *src = listFirst(migrating)->value;
+        clusterManagerNode *dst = listFirst(importing)->value;
+        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration were half inited on "migrating" node */
+    else if (listLength(migrating) == 1 && listLength(importing) == 0 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value == listFirst(migrating)->value) {
+        // Declare slot as stable
+        redisReply *r = CLUSTER_MANAGER_COMMAND(owner,
+            "CLUSTER SETSLOT %d STABLE", slot);
+        success = clusterManagerCheckRedisReply(owner, r, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration where half inited on "importing" node */
+    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value != listFirst(importing)->value) {
+        // Declare slot as stable
+        clusterManagerNode* notowner = listFirst(importing)->value;
+        redisReply *r = CLUSTER_MANAGER_COMMAND(notowner,
+            "CLUSTER SETSLOT %d STABLE", slot);
+        success = clusterManagerCheckRedisReply(notowner, r, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration were half done:
+     * - 'migrating' node already executed 'setslot .. node ..',
+     * - but 'importing' node didn't */
+    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
+            owner == NULL) {
+        owner = listFirst(importing)->value;
+        clusterManagerLogWarn("*** Fixing %s:%d as new slot owner ***\n",
+                owner->ip, owner->port);
+        redisReply *reply = CLUSTER_MANAGER_COMMAND(owner,
+                "CLUSTER SETSLOT %d NODE %s", slot, owner->name);
+        success = clusterManagerCheckRedisReply(owner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        if (!success) goto cleanup;
+        owner->slots[slot] = 1;
+        reply = CLUSTER_MANAGER_COMMAND(owner, "CLUSTER BUMPEPOCH");
+        success = clusterManagerCheckRedisReply(owner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        goto cleanup;
+    }
+    /* Common case: migrating were half done:
+     * - 'importing' node executed 'setslot .. node ..' command
+     * - 'migrating' node didn't
+     * So, we have two owners, one 'migrating' node that matches one of owner
+     * and no 'importing' nodes */
+    else if (listLength(owners) == 2 && listLength(migrating) == 1 &&
+            listLength(importing) == 0) {
+        clusterManagerNode* oldowner = listFirst(migrating)->value;
+        if (listFirst(owners)->value == (void*)oldowner) {
+            owner = listSecond(owners)->value;
+        } else if (listSecond(owners)->value == (void*)oldowner) {
+            owner = listFirst(owners)->value;
+        } else {
+            goto notHalfMigrated;
+        }
+        clusterManagerLogWarn("*** Finishing migrating slot %d from %s:%d to %s:%d ***\n",
+                slot, oldowner->ip, oldowner->port, owner->ip, owner->port);
+        redisReply *reply = CLUSTER_MANAGER_COMMAND(oldowner, "CLUSTER SETSLOT %d NODE %s",
+                        slot, owner->name);
+        success = clusterManagerCheckRedisReply(oldowner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        if (!success) goto cleanup;
+        oldowner->slots[slot] = 1;
+        goto cleanup;
+    }
+notHalfMigrated:
     /* If there is no slot owner, set as owner the slot with the biggest
      * number of keys, among the set of migrating / importing nodes. */
     if (owner == NULL) {
@@ -3775,6 +3852,7 @@ static int clusterManagerFixOpenSlot(int slot) {
             success = 0;
             goto cleanup;
         }
+
 
         // Use ADDSLOTS to assign the slot.
         clusterManagerLogWarn("*** Configuring %s:%d as the slot owner\n",
@@ -3803,6 +3881,7 @@ static int clusterManagerFixOpenSlot(int slot) {
          * nodes. */
         clusterManagerRemoveNodeFromList(migrating, owner);
         clusterManagerRemoveNodeFromList(importing, owner);
+        goto cleanup;
     }
     /* If there are multiple owners of the slot, we need to fix it
      * so that a single node is the owner and all the other nodes
@@ -3819,7 +3898,7 @@ static int clusterManagerFixOpenSlot(int slot) {
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *n = ln->value;
             if (n == owner) continue;
-            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOT %d", slot);
+            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOTS %d", slot);
             success = clusterManagerCheckRedisReply(n, reply, NULL);
             if (reply) freeReplyObject(reply);
             if (!success) goto cleanup;
@@ -3833,19 +3912,11 @@ static int clusterManagerFixOpenSlot(int slot) {
         if (reply) freeReplyObject(reply);
         if (!success) goto cleanup;
     }
-    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
-    /* Case 1: The slot is in migrating state in one slot, and in
-     *         importing state in 1 slot. That's trivial to address. */
-    if (listLength(migrating) == 1 && listLength(importing) == 1) {
-        clusterManagerNode *src = listFirst(migrating)->value;
-        clusterManagerNode *dst = listFirst(importing)->value;
-        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
-    }
-    /* Case 2: There are multiple nodes that claim the slot as importing,
+    /* There are multiple nodes that claim the slot as importing,
      * they probably got keys about the slot after a restart so opened
      * the slot. In this case we just move all the keys to the owner
      * according to the configuration. */
-    else if (listLength(migrating) == 0 && listLength(importing) > 0) {
+    if (listLength(migrating) == 0 && listLength(importing) > 0) {
         clusterManagerLogInfo(">>> Moving all the %d slot keys to its "
                               "owner %s:%d\n", slot, owner->ip, owner->port);
         move_opts |= CLUSTER_MANAGER_OPT_COLD;
