@@ -56,6 +56,7 @@ typedef struct list {
 /* Functions implemented as macros */
 #define listLength(l) ((l)->len)
 #define listFirst(l) ((l)->head)
+#define listSecond(l) ((l)->head->next)
 #define listLast(l) ((l)->tail)
 #define listPrevNode(n) ((n)->prev)
 #define listNextNode(n) ((n)->next)
