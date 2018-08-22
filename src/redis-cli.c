@@ -2817,8 +2817,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
                                            char **err)
 {
     int success = 1;
-    int do_fix = (config.cluster_manager_command.flags &
-                  CLUSTER_MANAGER_CMD_FLAG_FIX);
+    int replace_existed = (config.cluster_manager_command.flags &
+            (CLUSTER_MANAGER_CMD_FLAG_FIX | CLUSTER_MANAGER_CMD_FLAG_REPLACE));
     while (1) {
         char *dots = NULL;
         redisReply *reply = NULL, *migrate_reply = NULL;
@@ -2849,9 +2849,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
                                                          dots);
         if (migrate_reply == NULL) goto next;
         if (migrate_reply->type == REDIS_REPLY_ERROR) {
-            if (do_fix && strstr(migrate_reply->str, "BUSYKEY")) {
-                clusterManagerLogWarn("*** Target key exists. "
-                                      "Replacing it for FIX.\n");
+            if (replace_existed && strstr(migrate_reply->str, "BUSYKEY")) {
+                clusterManagerLogWarn("*** Target key exists. Replacing it.\n");
                 freeReplyObject(migrate_reply);
                 /* Try to migrate keys adding REPLACE option. */
                 migrate_reply = clusterManagerMigrateKeysInReply(source,
