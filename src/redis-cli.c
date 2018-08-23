@@ -4935,6 +4935,11 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
             goto cleanup;
         }
     }
+    // Bump epoch and broadcast for better stability
+    // Result is not checked for compatibility with previous redis versions.
+    redisReply *reply = CLUSTER_MANAGER_COMMAND(target, "CLUSTER BUMPEPOCH "
+            "BROADCAST");
+    if (reply) freeReplyObject(reply);
 cleanup:
     listRelease(sources);
     clusterManagerReleaseReshardTable(table);
@@ -5111,7 +5116,12 @@ static int clusterManagerCommandRebalance(int argc, char **argv) {
                     printf("#");
                     fflush(stdout);
                 }
-
+                // Bump epoch and broadcast for better stability
+                // Result is not checked for compatibility with previous
+                // redis versions.
+                redisReply *reply = CLUSTER_MANAGER_COMMAND(dst, "CLUSTER "
+                        "BUMPEPOCH BROADCAST");
+                if (reply) freeReplyObject(reply);
             }
             printf("\n");
 end_move:
