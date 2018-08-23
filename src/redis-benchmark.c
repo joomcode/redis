@@ -718,7 +718,10 @@ int main(int argc, const char **argv) {
     /* Run default benchmark suite. */
     data = zmalloc(config.datasize+1);
     do {
-        memset(data,'x',config.datasize);
+        for (i=0; i<config.datasize; i++) {
+            ((char*)data)[i] = random()%255+1;
+        }
+        //memset(data,'x',config.datasize);
         data[config.datasize] = '\0';
 
         if (test_is_selected("ping_inline") || test_is_selected("ping"))
