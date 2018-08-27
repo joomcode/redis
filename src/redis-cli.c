@@ -2817,8 +2817,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
                                            char **err)
 {
     int success = 1;
-    int do_fix = (config.cluster_manager_command.flags &
-                  CLUSTER_MANAGER_CMD_FLAG_FIX);
+    int replace_existed = (config.cluster_manager_command.flags &
+            (CLUSTER_MANAGER_CMD_FLAG_FIX | CLUSTER_MANAGER_CMD_FLAG_REPLACE));
     while (1) {
         char *dots = NULL;
         redisReply *reply = NULL, *migrate_reply = NULL;
@@ -2849,9 +2849,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
                                                          dots);
         if (migrate_reply == NULL) goto next;
         if (migrate_reply->type == REDIS_REPLY_ERROR) {
-            if (do_fix && strstr(migrate_reply->str, "BUSYKEY")) {
-                clusterManagerLogWarn("*** Target key exists. "
-                                      "Replacing it for FIX.\n");
+            if (replace_existed && strstr(migrate_reply->str, "BUSYKEY")) {
+                clusterManagerLogWarn("*** Target key exists. Replacing it.\n");
                 freeReplyObject(migrate_reply);
                 /* Try to migrate keys adding REPLACE option. */
                 migrate_reply = clusterManagerMigrateKeysInReply(source,
@@ -3758,6 +3757,83 @@ static int clusterManagerFixOpenSlot(int slot) {
     }
     printf("Set as migrating in: %s\n", migrating_str);
     printf("Set as importing in: %s\n", importing_str);
+    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
+    /* Common case: The slot is in migrating state in one slot, and in
+     *         importing state in 1 slot. That's trivial to address. */
+    if (listLength(migrating) == 1 && listLength(importing) == 1 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value == listFirst(migrating)->value) {
+        clusterManagerNode *src = listFirst(migrating)->value;
+        clusterManagerNode *dst = listFirst(importing)->value;
+        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration were half inited on "migrating" node */
+    else if (listLength(migrating) == 1 && listLength(importing) == 0 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value == listFirst(migrating)->value) {
+        // Declare slot as stable
+        redisReply *r = CLUSTER_MANAGER_COMMAND(owner,
+            "CLUSTER SETSLOT %d STABLE", slot);
+        success = clusterManagerCheckRedisReply(owner, r, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration where half inited on "importing" node */
+    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
+            listLength(owners) == 1 &&
+            listFirst(owners)->value != listFirst(importing)->value) {
+        // Declare slot as stable
+        clusterManagerNode* notowner = listFirst(importing)->value;
+        redisReply *r = CLUSTER_MANAGER_COMMAND(notowner,
+            "CLUSTER SETSLOT %d STABLE", slot);
+        success = clusterManagerCheckRedisReply(notowner, r, NULL);
+        goto cleanup;
+    }
+    /* Common case: migration were half done:
+     * - 'migrating' node already executed 'setslot .. node ..',
+     * - but 'importing' node didn't */
+    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
+            owner == NULL) {
+        owner = listFirst(importing)->value;
+        clusterManagerLogWarn("*** Fixing %s:%d as new slot owner ***\n",
+                owner->ip, owner->port);
+        redisReply *reply = CLUSTER_MANAGER_COMMAND(owner,
+                "CLUSTER SETSLOT %d NODE %s", slot, owner->name);
+        success = clusterManagerCheckRedisReply(owner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        if (!success) goto cleanup;
+        owner->slots[slot] = 1;
+        reply = CLUSTER_MANAGER_COMMAND(owner, "CLUSTER BUMPEPOCH");
+        success = clusterManagerCheckRedisReply(owner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        goto cleanup;
+    }
+    /* Common case: migrating were half done:
+     * - 'importing' node executed 'setslot .. node ..' command
+     * - 'migrating' node didn't
+     * So, we have two owners, one 'migrating' node that matches one of owner
+     * and no 'importing' nodes */
+    else if (listLength(owners) == 2 && listLength(migrating) == 1 &&
+            listLength(importing) == 0) {
+        clusterManagerNode* oldowner = listFirst(migrating)->value;
+        if (listFirst(owners)->value == (void*)oldowner) {
+            owner = listSecond(owners)->value;
+        } else if (listSecond(owners)->value == (void*)oldowner) {
+            owner = listFirst(owners)->value;
+        } else {
+            goto notHalfMigrated;
+        }
+        clusterManagerLogWarn("*** Finishing migrating slot %d from %s:%d to %s:%d ***\n",
+                slot, oldowner->ip, oldowner->port, owner->ip, owner->port);
+        redisReply *reply = CLUSTER_MANAGER_COMMAND(oldowner, "CLUSTER SETSLOT %d NODE %s",
+                        slot, owner->name);
+        success = clusterManagerCheckRedisReply(oldowner, reply, NULL);
+        if (reply) freeReplyObject(reply);
+        if (!success) goto cleanup;
+        oldowner->slots[slot] = 1;
+        goto cleanup;
+    }
+notHalfMigrated:
     /* If there is no slot owner, set as owner the slot with the biggest
      * number of keys, among the set of migrating / importing nodes. */
     if (owner == NULL) {
@@ -3772,6 +3848,7 @@ static int clusterManagerFixOpenSlot(int slot) {
             success = 0;
             goto cleanup;
         }
+
 
         // Use ADDSLOTS to assign the slot.
         clusterManagerLogWarn("*** Configuring %s:%d as the slot owner\n",
@@ -3800,6 +3877,7 @@ static int clusterManagerFixOpenSlot(int slot) {
          * nodes. */
         clusterManagerRemoveNodeFromList(migrating, owner);
         clusterManagerRemoveNodeFromList(importing, owner);
+        goto cleanup;
     }
     /* If there are multiple owners of the slot, we need to fix it
      * so that a single node is the owner and all the other nodes
@@ -3816,7 +3894,7 @@ static int clusterManagerFixOpenSlot(int slot) {
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *n = ln->value;
             if (n == owner) continue;
-            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOT %d", slot);
+            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOTS %d", slot);
             success = clusterManagerCheckRedisReply(n, reply, NULL);
             if (reply) freeReplyObject(reply);
             if (!success) goto cleanup;
@@ -3830,19 +3908,11 @@ static int clusterManagerFixOpenSlot(int slot) {
         if (reply) freeReplyObject(reply);
         if (!success) goto cleanup;
     }
-    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
-    /* Case 1: The slot is in migrating state in one slot, and in
-     *         importing state in 1 slot. That's trivial to address. */
-    if (listLength(migrating) == 1 && listLength(importing) == 1) {
-        clusterManagerNode *src = listFirst(migrating)->value;
-        clusterManagerNode *dst = listFirst(importing)->value;
-        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
-    }
-    /* Case 2: There are multiple nodes that claim the slot as importing,
+    /* There are multiple nodes that claim the slot as importing,
      * they probably got keys about the slot after a restart so opened
      * the slot. In this case we just move all the keys to the owner
      * according to the configuration. */
-    else if (listLength(migrating) == 0 && listLength(importing) > 0) {
+    if (listLength(migrating) == 0 && listLength(importing) > 0) {
         clusterManagerLogInfo(">>> Moving all the %d slot keys to its "
                               "owner %s:%d\n", slot, owner->ip, owner->port);
         move_opts |= CLUSTER_MANAGER_OPT_COLD;
@@ -3977,11 +4047,32 @@ static int clusterManagerCheckCluster(int quiet) {
             char *fmt = (i++ > 0 ? ",%S" : "%S");
             errstr = sdscatfmt(errstr, fmt, slot);
         }
+        dictReleaseIterator(iter);
         clusterManagerLogErr("%s.\n", (char *) errstr);
         sdsfree(errstr);
         if (do_fix) {
             // Fix open slots.
-            dictReleaseIterator(iter);
+            // First, iterate through hosts and fix slots that should be
+            // imported.
+            listRewind(cluster_manager.nodes, &li);
+            while ((ln = listNext(&li)) != NULL) {
+                clusterManagerNode *n = ln->value;
+                if (n->importing == NULL) {
+                    continue;
+                }
+                for (i = 0; i < n->importing_count; i += 2) {
+                    sds slot = n->importing[i];
+                    result = clusterManagerFixOpenSlot(atoi(slot));
+                    if (!result) break;
+                    dictDelete(open_slots, slot);
+                }
+                redisReply *reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER "
+                        "BUMPEPOCH BROADCAST");
+                // old version doesn't recognize BROADCAST,
+                // so doesn't check answer
+                if (reply) freeReplyObject(reply);
+            }
+
             iter = dictGetIterator(open_slots);
             while ((entry = dictNext(iter)) != NULL) {
                 sds slot = (sds) dictGetKey(entry);
@@ -3989,7 +4080,6 @@ static int clusterManagerCheckCluster(int quiet) {
                 if (!result) break;
             }
         }
-        dictReleaseIterator(iter);
         dictRelease(open_slots);
     }
     clusterManagerLogInfo(">>> Check slots coverage...\n");
@@ -4844,6 +4934,11 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
             goto cleanup;
         }
     }
+    // Bump epoch and broadcast for better stability
+    // Result is not checked for compatibility with previous redis versions.
+    redisReply *reply = CLUSTER_MANAGER_COMMAND(target, "CLUSTER BUMPEPOCH "
+            "BROADCAST");
+    if (reply) freeReplyObject(reply);
 cleanup:
     listRelease(sources);
     clusterManagerReleaseReshardTable(table);
@@ -5020,7 +5115,12 @@ static int clusterManagerCommandRebalance(int argc, char **argv) {
                     printf("#");
                     fflush(stdout);
                 }
-
+                // Bump epoch and broadcast for better stability
+                // Result is not checked for compatibility with previous
+                // redis versions.
+                redisReply *reply = CLUSTER_MANAGER_COMMAND(dst, "CLUSTER "
+                        "BUMPEPOCH BROADCAST");
+                if (reply) freeReplyObject(reply);
             }
             printf("\n");
 end_move:
