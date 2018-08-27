@@ -22,6 +22,7 @@
 #define CLUSTER_FAIL_UNDO_TIME_ADD 10 /* Some additional time. */
 #define CLUSTER_FAILOVER_DELAY 5 /* Seconds */
 #define CLUSTER_DEFAULT_MIGRATION_BARRIER 1
+#define CLUSTER_DEFAULT_MIGRATE_FROM_EMPTY 1 /* Migrate slave when master becomes empty by default. */
 #define CLUSTER_MF_TIMEOUT 5000 /* Milliseconds to do a manual failover. */
 #define CLUSTER_MF_PAUSE_MULT 2 /* Master pause manual failover mult. */
 #define CLUSTER_SLAVE_MIGRATION_DELAY 5000 /* Delay for slave migration. */
