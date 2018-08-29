@@ -1,0 +1,14 @@
+# Automatically added by dh_systemd_enable/11.1.6ubuntu2
+if [ "$1" = "remove" ]; then
+	if [ -x "/usr/bin/deb-systemd-helper" ]; then
+		deb-systemd-helper mask 'redis-sentinel.service' >/dev/null || true
+	fi
+fi
+
+if [ "$1" = "purge" ]; then
+	if [ -x "/usr/bin/deb-systemd-helper" ]; then
+		deb-systemd-helper purge 'redis-sentinel.service' >/dev/null || true
+		deb-systemd-helper unmask 'redis-sentinel.service' >/dev/null || true
+	fi
+fi
+# End automatically added section

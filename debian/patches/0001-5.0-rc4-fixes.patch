@@ -1,0 +1,857 @@
+diff --git a/redis.conf b/redis.conf
+index 5cbc74bb..61ce9778 100644
+--- a/redis.conf
++++ b/redis.conf
+@@ -890,6 +890,19 @@ lua-time-limit 5000
+ #
+ # cluster-migration-barrier 1
+ 
++# By default when master becomes empty due to rebalancing, its slaves will
++# reattach to new owner of last migrated slot.
++# Since start of replication is quite cpu consuming operation (because new
++# master will transmit its dump), this option allows to disable such migration.
++# Also it may help to stabilize cluster topology (together with
++# cluster-migration-barrier set to hight value) in case you rely on external
++# tool for topology management.
++#
++# Default is 'yes' (slave will switch to other master if current master became
++# empty). A value 'no' will disable such automigration.
++#
++# cluster-migrate-from-empty yes
++
+ # By default Redis Cluster nodes stop accepting queries if they detect there
+ # is at least an hash slot uncovered (no available node is serving it).
+ # This way if the cluster is partially down (for example a range of hash slots
+diff --git a/src/adlist.h b/src/adlist.h
+index c954fac8..790220ef 100644
+--- a/src/adlist.h
++++ b/src/adlist.h
+@@ -56,6 +56,7 @@ typedef struct list {
+ /* Functions implemented as macros */
+ #define listLength(l) ((l)->len)
+ #define listFirst(l) ((l)->head)
++#define listSecond(l) ((l)->head->next)
+ #define listLast(l) ((l)->tail)
+ #define listPrevNode(n) ((n)->prev)
+ #define listNextNode(n) ((n)->next)
+diff --git a/src/cluster.c b/src/cluster.c
+index 2f3e298e..737288b1 100644
+--- a/src/cluster.c
++++ b/src/cluster.c
+@@ -1015,7 +1015,7 @@ int clusterBumpConfigEpochWithoutConsensus(void) {
+     if (myself->configEpoch == 0 ||
+         myself->configEpoch != maxEpoch)
+     {
+-        server.cluster->currentEpoch++;
++        server.cluster->currentEpoch = maxEpoch + 1;
+         myself->configEpoch = server.cluster->currentEpoch;
+         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
+                              CLUSTER_TODO_FSYNC_CONFIG);
+@@ -1028,6 +1028,22 @@ int clusterBumpConfigEpochWithoutConsensus(void) {
+     }
+ }
+ 
++/* This function is called to finish batch migration of slots.
++ * To not deal with possible epoch collisions, it is better to explicitely
++ * bump epoch after last importing slot was closed.
++ * redis-cli tool will send CLUSTER BUMPEPOCH BROADCAST. */
++void clusterBumpConfigEpochForConsensus(void) {
++    uint64_t maxEpoch = clusterGetMaxEpoch();
++
++    server.cluster->currentEpoch = maxEpoch + 1;
++    myself->configEpoch = server.cluster->currentEpoch;
++    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
++                         CLUSTER_TODO_FSYNC_CONFIG);
++    serverLog(LL_WARNING,
++        "New configEpoch set to %llu",
++        (unsigned long long) myself->configEpoch);
++}
++
+ /* This function is called when this node is a master, and we receive from
+  * another master a configuration epoch that is equal to our configuration
+  * epoch.
+@@ -1596,7 +1612,7 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
+      *    master.
+      * 2) We are a slave and our master is left without slots. We need
+      *    to replicate to the new slots owner. */
+-    if (newmaster && curmaster->numslots == 0) {
++    if (server.cluster_migrate_from_empty && newmaster && curmaster->numslots == 0) {
+         serverLog(LL_WARNING,
+             "Configuration change detected. Reconfiguring myself "
+             "as a replica of %.40s", sender->name);
+@@ -4183,7 +4199,7 @@ void clusterCommand(client *c) {
+     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr,"help")) {
+         const char *help[] = {
+ "ADDSLOTS <slot> [slot ...] -- Assign slots to current node.",
+-"BUMPEPOCH -- Advance the cluster config epoch.",
++"BUMPEPOCH [broadcast] -- Advance the cluster config epoch.",
+ "COUNT-failure-reports <node-id> -- Return number of failure reports for <node-id>.",
+ "COUNTKEYSINSLOT <slot> - Return the number of keys in <slot>.",
+ "DELSLOTS <slot> [slot ...] -- Delete slots information from current node.",
+@@ -4405,13 +4421,24 @@ NULL
+         }
+         clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|CLUSTER_TODO_UPDATE_STATE);
+         addReply(c,shared.ok);
+-    } else if (!strcasecmp(c->argv[1]->ptr,"bumpepoch") && c->argc == 2) {
++    } else if (!strcasecmp(c->argv[1]->ptr,"bumpepoch") && (c->argc == 2 || c->argc == 3)) {
+         /* CLUSTER BUMPEPOCH */
+-        int retval = clusterBumpConfigEpochWithoutConsensus();
+-        sds reply = sdscatprintf(sdsempty(),"+%s %llu\r\n",
+-                (retval == C_OK) ? "BUMPED" : "STILL",
+-                (unsigned long long) myself->configEpoch);
+-        addReplySds(c,reply);
++        if (c->argc == 2) {
++            int retval = clusterBumpConfigEpochWithoutConsensus();
++            sds reply = sdscatprintf(sdsempty(),"+%s %llu\r\n",
++                    (retval == C_OK) ? "BUMPED" : "STILL",
++                    (unsigned long long) myself->configEpoch);
++            addReplySds(c,reply);
++        } else if (!strcasecmp(c->argv[2]->ptr, "broadcast")) {
++            clusterBumpConfigEpochForConsensus();
++            sds reply = sdscatprintf(sdsempty(),"+BUMPED %llu\r\n",
++                    (unsigned long long) myself->configEpoch);
++            clusterBroadcastPong(CLUSTER_BROADCAST_ALL);
++            addReplySds(c,reply);
++        } else {
++            addReplyError(c,
++                "Invalid CLUSTER BUMPEPOCH action or number of arguments. Try CLUSTER HELP");
++        }
+     } else if (!strcasecmp(c->argv[1]->ptr,"info") && c->argc == 2) {
+         /* CLUSTER INFO */
+         char *statestr[] = {"ok","fail","needhelp"};
+diff --git a/src/cluster.h b/src/cluster.h
+index 6f9954d2..f32e8265 100644
+--- a/src/cluster.h
++++ b/src/cluster.h
+@@ -22,6 +22,7 @@
+ #define CLUSTER_FAIL_UNDO_TIME_ADD 10 /* Some additional time. */
+ #define CLUSTER_FAILOVER_DELAY 5 /* Seconds */
+ #define CLUSTER_DEFAULT_MIGRATION_BARRIER 1
++#define CLUSTER_DEFAULT_MIGRATE_FROM_EMPTY 1 /* Migrate slave when master becomes empty by default. */
+ #define CLUSTER_MF_TIMEOUT 5000 /* Milliseconds to do a manual failover. */
+ #define CLUSTER_MF_PAUSE_MULT 2 /* Master pause manual failover mult. */
+ #define CLUSTER_SLAVE_MIGRATION_DELAY 5000 /* Delay for slave migration. */
+diff --git a/src/config.c b/src/config.c
+index 7bd9592b..c500129c 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -655,6 +655,14 @@ void loadServerConfigFromString(char *config) {
+                 err = "cluster migration barrier must zero or positive";
+                 goto loaderr;
+             }
++        } else if (!strcasecmp(argv[0],"cluster-migrate-from-empty") &&
++                   argc == 2)
++        {
++            server.cluster_migrate_from_empty = yesnotoi(argv[1]);
++            if (server.cluster_migrate_from_empty == -1) {
++                err = "argument must be 'yes' or 'no'";
++                goto loaderr;
++            }
+         } else if (!strcasecmp(argv[0],"cluster-slave-validity-factor")
+                    && argc == 2)
+         {
+@@ -1035,6 +1043,8 @@ void configSetCommand(client *c) {
+       "cluster-require-full-coverage",server.cluster_require_full_coverage) {
+     } config_set_bool_field(
+       "cluster-slave-no-failover",server.cluster_slave_no_failover) {
++    } config_set_bool_field(
++      "cluster-migrate-from-empty",server.cluster_migrate_from_empty) {
+     } config_set_bool_field(
+       "aof-rewrite-incremental-fsync",server.aof_rewrite_incremental_fsync) {
+     } config_set_bool_field(
+@@ -1347,6 +1357,8 @@ void configGetCommand(client *c) {
+             server.cluster_require_full_coverage);
+     config_get_bool_field("cluster-slave-no-failover",
+             server.cluster_slave_no_failover);
++    config_get_bool_field("cluster-migrate-from-empty",
++            server.cluster_migrate_from_empty);
+     config_get_bool_field("no-appendfsync-on-rewrite",
+             server.aof_no_fsync_on_rewrite);
+     config_get_bool_field("slave-serve-stale-data",
+@@ -2087,6 +2099,7 @@ int rewriteConfig(char *path) {
+     rewriteConfigYesNoOption(state,"cluster-slave-no-failover",server.cluster_slave_no_failover,CLUSTER_DEFAULT_SLAVE_NO_FAILOVER);
+     rewriteConfigNumericalOption(state,"cluster-node-timeout",server.cluster_node_timeout,CLUSTER_DEFAULT_NODE_TIMEOUT);
+     rewriteConfigNumericalOption(state,"cluster-migration-barrier",server.cluster_migration_barrier,CLUSTER_DEFAULT_MIGRATION_BARRIER);
++    rewriteConfigYesNoOption(state,"cluster-migrate-from-empty",server.cluster_migrate_from_empty,CLUSTER_DEFAULT_MIGRATE_FROM_EMPTY);
+     rewriteConfigNumericalOption(state,"cluster-slave-validity-factor",server.cluster_slave_validity_factor,CLUSTER_DEFAULT_SLAVE_VALIDITY);
+     rewriteConfigNumericalOption(state,"slowlog-log-slower-than",server.slowlog_log_slower_than,CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN);
+     rewriteConfigNumericalOption(state,"latency-monitor-threshold",server.latency_monitor_threshold,CONFIG_DEFAULT_LATENCY_MONITOR_THRESHOLD);
+diff --git a/src/redis-benchmark.c b/src/redis-benchmark.c
+index d30879dc..cd7ccab1 100644
+--- a/src/redis-benchmark.c
++++ b/src/redis-benchmark.c
+@@ -718,7 +718,10 @@ int main(int argc, const char **argv) {
+     /* Run default benchmark suite. */
+     data = zmalloc(config.datasize+1);
+     do {
+-        memset(data,'x',config.datasize);
++        for (i=0; i<config.datasize; i++) {
++            ((char*)data)[i] = random()%255+1;
++        }
++        //memset(data,'x',config.datasize);
+         data[config.datasize] = '\0';
+ 
+         if (test_is_selected("ping_inline") || test_is_selected("ping"))
+diff --git a/src/redis-cli.c b/src/redis-cli.c
+index 0e8777bd..3618daa1 100644
+--- a/src/redis-cli.c
++++ b/src/redis-cli.c
+@@ -2817,8 +2817,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
+                                            char **err)
+ {
+     int success = 1;
+-    int do_fix = (config.cluster_manager_command.flags &
+-                  CLUSTER_MANAGER_CMD_FLAG_FIX);
++    int replace_existed = (config.cluster_manager_command.flags &
++            (CLUSTER_MANAGER_CMD_FLAG_FIX | CLUSTER_MANAGER_CMD_FLAG_REPLACE));
+     while (1) {
+         char *dots = NULL;
+         redisReply *reply = NULL, *migrate_reply = NULL;
+@@ -2849,9 +2849,8 @@ static int clusterManagerMigrateKeysInSlot(clusterManagerNode *source,
+                                                          dots);
+         if (migrate_reply == NULL) goto next;
+         if (migrate_reply->type == REDIS_REPLY_ERROR) {
+-            if (do_fix && strstr(migrate_reply->str, "BUSYKEY")) {
+-                clusterManagerLogWarn("*** Target key exists. "
+-                                      "Replacing it for FIX.\n");
++            if (replace_existed && strstr(migrate_reply->str, "BUSYKEY")) {
++                clusterManagerLogWarn("*** Target key exists. Replacing it.\n");
+                 freeReplyObject(migrate_reply);
+                 /* Try to migrate keys adding REPLACE option. */
+                 migrate_reply = clusterManagerMigrateKeysInReply(source,
+@@ -3758,6 +3757,83 @@ static int clusterManagerFixOpenSlot(int slot) {
+     }
+     printf("Set as migrating in: %s\n", migrating_str);
+     printf("Set as importing in: %s\n", importing_str);
++    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
++    /* Common case: The slot is in migrating state in one slot, and in
++     *         importing state in 1 slot. That's trivial to address. */
++    if (listLength(migrating) == 1 && listLength(importing) == 1 &&
++            listLength(owners) == 1 &&
++            listFirst(owners)->value == listFirst(migrating)->value) {
++        clusterManagerNode *src = listFirst(migrating)->value;
++        clusterManagerNode *dst = listFirst(importing)->value;
++        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
++        goto cleanup;
++    }
++    /* Common case: migration were half inited on "migrating" node */
++    else if (listLength(migrating) == 1 && listLength(importing) == 0 &&
++            listLength(owners) == 1 &&
++            listFirst(owners)->value == listFirst(migrating)->value) {
++        // Declare slot as stable
++        redisReply *r = CLUSTER_MANAGER_COMMAND(owner,
++            "CLUSTER SETSLOT %d STABLE", slot);
++        success = clusterManagerCheckRedisReply(owner, r, NULL);
++        goto cleanup;
++    }
++    /* Common case: migration where half inited on "importing" node */
++    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
++            listLength(owners) == 1 &&
++            listFirst(owners)->value != listFirst(importing)->value) {
++        // Declare slot as stable
++        clusterManagerNode* notowner = listFirst(importing)->value;
++        redisReply *r = CLUSTER_MANAGER_COMMAND(notowner,
++            "CLUSTER SETSLOT %d STABLE", slot);
++        success = clusterManagerCheckRedisReply(notowner, r, NULL);
++        goto cleanup;
++    }
++    /* Common case: migration were half done:
++     * - 'migrating' node already executed 'setslot .. node ..',
++     * - but 'importing' node didn't */
++    else if (listLength(migrating) == 0 && listLength(importing) == 1 &&
++            owner == NULL) {
++        owner = listFirst(importing)->value;
++        clusterManagerLogWarn("*** Fixing %s:%d as new slot owner ***\n",
++                owner->ip, owner->port);
++        redisReply *reply = CLUSTER_MANAGER_COMMAND(owner,
++                "CLUSTER SETSLOT %d NODE %s", slot, owner->name);
++        success = clusterManagerCheckRedisReply(owner, reply, NULL);
++        if (reply) freeReplyObject(reply);
++        if (!success) goto cleanup;
++        owner->slots[slot] = 1;
++        reply = CLUSTER_MANAGER_COMMAND(owner, "CLUSTER BUMPEPOCH");
++        success = clusterManagerCheckRedisReply(owner, reply, NULL);
++        if (reply) freeReplyObject(reply);
++        goto cleanup;
++    }
++    /* Common case: migrating were half done:
++     * - 'importing' node executed 'setslot .. node ..' command
++     * - 'migrating' node didn't
++     * So, we have two owners, one 'migrating' node that matches one of owner
++     * and no 'importing' nodes */
++    else if (listLength(owners) == 2 && listLength(migrating) == 1 &&
++            listLength(importing) == 0) {
++        clusterManagerNode* oldowner = listFirst(migrating)->value;
++        if (listFirst(owners)->value == (void*)oldowner) {
++            owner = listSecond(owners)->value;
++        } else if (listSecond(owners)->value == (void*)oldowner) {
++            owner = listFirst(owners)->value;
++        } else {
++            goto notHalfMigrated;
++        }
++        clusterManagerLogWarn("*** Finishing migrating slot %d from %s:%d to %s:%d ***\n",
++                slot, oldowner->ip, oldowner->port, owner->ip, owner->port);
++        redisReply *reply = CLUSTER_MANAGER_COMMAND(oldowner, "CLUSTER SETSLOT %d NODE %s",
++                        slot, owner->name);
++        success = clusterManagerCheckRedisReply(oldowner, reply, NULL);
++        if (reply) freeReplyObject(reply);
++        if (!success) goto cleanup;
++        oldowner->slots[slot] = 1;
++        goto cleanup;
++    }
++notHalfMigrated:
+     /* If there is no slot owner, set as owner the slot with the biggest
+      * number of keys, among the set of migrating / importing nodes. */
+     if (owner == NULL) {
+@@ -3773,6 +3849,7 @@ static int clusterManagerFixOpenSlot(int slot) {
+             goto cleanup;
+         }
+ 
++
+         // Use ADDSLOTS to assign the slot.
+         clusterManagerLogWarn("*** Configuring %s:%d as the slot owner\n",
+                               owner->ip, owner->port);
+@@ -3800,6 +3877,7 @@ static int clusterManagerFixOpenSlot(int slot) {
+          * nodes. */
+         clusterManagerRemoveNodeFromList(migrating, owner);
+         clusterManagerRemoveNodeFromList(importing, owner);
++        goto cleanup;
+     }
+     /* If there are multiple owners of the slot, we need to fix it
+      * so that a single node is the owner and all the other nodes
+@@ -3816,7 +3894,7 @@ static int clusterManagerFixOpenSlot(int slot) {
+         while ((ln = listNext(&li)) != NULL) {
+             clusterManagerNode *n = ln->value;
+             if (n == owner) continue;
+-            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOT %d", slot);
++            reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER DELSLOTS %d", slot);
+             success = clusterManagerCheckRedisReply(n, reply, NULL);
+             if (reply) freeReplyObject(reply);
+             if (!success) goto cleanup;
+@@ -3830,19 +3908,11 @@ static int clusterManagerFixOpenSlot(int slot) {
+         if (reply) freeReplyObject(reply);
+         if (!success) goto cleanup;
+     }
+-    int move_opts = CLUSTER_MANAGER_OPT_VERBOSE;
+-    /* Case 1: The slot is in migrating state in one slot, and in
+-     *         importing state in 1 slot. That's trivial to address. */
+-    if (listLength(migrating) == 1 && listLength(importing) == 1) {
+-        clusterManagerNode *src = listFirst(migrating)->value;
+-        clusterManagerNode *dst = listFirst(importing)->value;
+-        success = clusterManagerMoveSlot(src, dst, slot, move_opts, NULL);
+-    }
+-    /* Case 2: There are multiple nodes that claim the slot as importing,
++    /* There are multiple nodes that claim the slot as importing,
+      * they probably got keys about the slot after a restart so opened
+      * the slot. In this case we just move all the keys to the owner
+      * according to the configuration. */
+-    else if (listLength(migrating) == 0 && listLength(importing) > 0) {
++    if (listLength(migrating) == 0 && listLength(importing) > 0) {
+         clusterManagerLogInfo(">>> Moving all the %d slot keys to its "
+                               "owner %s:%d\n", slot, owner->ip, owner->port);
+         move_opts |= CLUSTER_MANAGER_OPT_COLD;
+@@ -3977,11 +4047,32 @@ static int clusterManagerCheckCluster(int quiet) {
+             char *fmt = (i++ > 0 ? ",%S" : "%S");
+             errstr = sdscatfmt(errstr, fmt, slot);
+         }
++        dictReleaseIterator(iter);
+         clusterManagerLogErr("%s.\n", (char *) errstr);
+         sdsfree(errstr);
+         if (do_fix) {
+             // Fix open slots.
+-            dictReleaseIterator(iter);
++            // First, iterate through hosts and fix slots that should be
++            // imported.
++            listRewind(cluster_manager.nodes, &li);
++            while ((ln = listNext(&li)) != NULL) {
++                clusterManagerNode *n = ln->value;
++                if (n->importing == NULL) {
++                    continue;
++                }
++                for (i = 0; i < n->importing_count; i += 2) {
++                    sds slot = n->importing[i];
++                    result = clusterManagerFixOpenSlot(atoi(slot));
++                    if (!result) break;
++                    dictDelete(open_slots, slot);
++                }
++                redisReply *reply = CLUSTER_MANAGER_COMMAND(n, "CLUSTER "
++                        "BUMPEPOCH BROADCAST");
++                // old version doesn't recognize BROADCAST,
++                // so doesn't check answer
++                if (reply) freeReplyObject(reply);
++            }
++
+             iter = dictGetIterator(open_slots);
+             while ((entry = dictNext(iter)) != NULL) {
+                 sds slot = (sds) dictGetKey(entry);
+@@ -3989,7 +4080,6 @@ static int clusterManagerCheckCluster(int quiet) {
+                 if (!result) break;
+             }
+         }
+-        dictReleaseIterator(iter);
+         dictRelease(open_slots);
+     }
+     clusterManagerLogInfo(">>> Check slots coverage...\n");
+@@ -4844,6 +4934,11 @@ static int clusterManagerCommandReshard(int argc, char **argv) {
+             goto cleanup;
+         }
+     }
++    // Bump epoch and broadcast for better stability
++    // Result is not checked for compatibility with previous redis versions.
++    redisReply *reply = CLUSTER_MANAGER_COMMAND(target, "CLUSTER BUMPEPOCH "
++            "BROADCAST");
++    if (reply) freeReplyObject(reply);
+ cleanup:
+     listRelease(sources);
+     clusterManagerReleaseReshardTable(table);
+@@ -5020,7 +5115,12 @@ static int clusterManagerCommandRebalance(int argc, char **argv) {
+                     printf("#");
+                     fflush(stdout);
+                 }
+-
++                // Bump epoch and broadcast for better stability
++                // Result is not checked for compatibility with previous
++                // redis versions.
++                redisReply *reply = CLUSTER_MANAGER_COMMAND(dst, "CLUSTER "
++                        "BUMPEPOCH BROADCAST");
++                if (reply) freeReplyObject(reply);
+             }
+             printf("\n");
+ end_move:
+diff --git a/src/server.c b/src/server.c
+index 66d42ee6..688174e8 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -1613,6 +1613,7 @@ void initServerConfig(void) {
+     server.cluster_enabled = 0;
+     server.cluster_node_timeout = CLUSTER_DEFAULT_NODE_TIMEOUT;
+     server.cluster_migration_barrier = CLUSTER_DEFAULT_MIGRATION_BARRIER;
++    server.cluster_migrate_from_empty = CLUSTER_DEFAULT_MIGRATE_FROM_EMPTY;
+     server.cluster_slave_validity_factor = CLUSTER_DEFAULT_SLAVE_VALIDITY;
+     server.cluster_require_full_coverage = CLUSTER_DEFAULT_REQUIRE_FULL_COVERAGE;
+     server.cluster_slave_no_failover = CLUSTER_DEFAULT_SLAVE_NO_FAILOVER;
+diff --git a/src/server.h b/src/server.h
+index 186d0825..b16ebbab 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -1221,6 +1221,7 @@ struct redisServer {
+     char *cluster_configfile; /* Cluster auto-generated config file name. */
+     struct clusterState *cluster;  /* State of the cluster */
+     int cluster_migration_barrier; /* Cluster replicas migration barrier. */
++    int cluster_migrate_from_empty; /* Migration of slave when master loose its last slot*/
+     int cluster_slave_validity_factor; /* Slave max data age for failover. */
+     int cluster_require_full_coverage; /* If true, put the cluster down if
+                                           there is at least an uncovered slot.*/
+diff --git a/tests/cluster/tests/12.1-replica-migration-3.tcl b/tests/cluster/tests/12.1-replica-migration-3.tcl
+new file mode 100644
+index 00000000..a3c863f3
+--- /dev/null
++++ b/tests/cluster/tests/12.1-replica-migration-3.tcl
+@@ -0,0 +1,69 @@
++# Replica migration test #2.
++#
++# Check that if 'cluster-migrat-from-empty' is set to 'no', slaves do not
++# migrate when master becomes empty.
++
++source "../tests/includes/init-tests.tcl"
++
++# Create a cluster with 5 master and 15 slaves, to make sure there are no
++# empty masters and make rebalancing simpler to handle during the test.
++test "Create a 5 nodes cluster" {
++    create_cluster 5 15
++}
++
++test "Cluster is up" {
++    assert_cluster_state ok
++}
++
++test "Each master should have at least two replicas attached" {
++    foreach_redis_id id {
++        if {$id < 5} {
++            wait_for_condition 1000 50 {
++                [llength [lindex [R 0 role] 2]] >= 2
++            } else {
++                fail "Master #$id does not have 2 slaves as expected"
++            }
++        }
++    }
++}
++
++test "Set migrate-from-empty no" {
++    foreach_redis_id id {
++        R $id CONFIG SET cluster-migrate-from-empty no
++    }
++}
++
++set master0_id [dict get [get_myself 0] id]
++test "Resharding all the master #0 slots away from it" {
++    set output [exec \
++        ../../../src/redis-cli --cluster rebalance \
++        127.0.0.1:[get_instance_attrib redis 0 port] \
++        --cluster-weight ${master0_id}=0 >@ stdout ]
++}
++
++test "Wait cluster to be stable" {
++    wait_for_condition 1000 50 {
++        [catch {exec ../../../src/redis-cli --cluster \
++            check 127.0.0.1:[get_instance_attrib redis 0 port] \
++            }] == 0
++    } else {
++        fail "Master #0 still has replicas"
++    }
++}
++
++test "Master #0 stil should have its replicas" {
++    assert { [llength [lindex [R 0 role] 2]] >= 2 }
++}
++
++test "Each master should have at least two replicas attached" {
++    foreach_redis_id id {
++        if {$id < 5} {
++            wait_for_condition 1000 50 {
++                [llength [lindex [R 0 role] 2]] >= 2
++            } else {
++                fail "Master #$id does not have 2 slaves as expected"
++            }
++        }
++    }
++}
++
+diff --git a/tests/cluster/tests/14-fix-slot-migration.tcl b/tests/cluster/tests/14-fix-slot-migration.tcl
+new file mode 100644
+index 00000000..299cb1b6
+--- /dev/null
++++ b/tests/cluster/tests/14-fix-slot-migration.tcl
+@@ -0,0 +1,152 @@
++# Test fix of half migrated slot.
++# If old slot owner already received 'setslot <slotid> node <newowner>' command,
++# but new owner didn't, then where is now "owner" and it is still 'importing' in new owner.
++# Since new owner alread has slots, it fails to accept "CLUSTER ADDSLOTS" command.
++
++source "../tests/includes/init-tests.tcl"
++
++test "Create a 2 nodes cluster" {
++    create_cluster 2 0
++}
++
++test "Cluster is up" {
++    assert_cluster_state ok
++}
++
++set cluster [redis_cluster 127.0.0.1:[get_instance_attrib redis 0 port]]
++catch {unset nodefrom}
++catch {unset nodeto}
++proc reset_cluster {} {
++    uplevel 1 {
++        $cluster refresh_nodes_map
++        array set nodefrom [$cluster masternode_for_slot 609]
++        array set nodeto [$cluster masternode_notfor_slot 609]
++    }
++}
++
++proc fix_cluster {} {
++    uplevel 1 {
++        set code [catch {
++            exec ../../../src/redis-cli --cluster fix $nodefrom(addr) << yes
++        } result]
++        if {$code != 0 && $::verbose} {
++            puts $result
++        }
++        assert {$code == 0}
++        assert_cluster_state ok
++        wait_for_condition 1000 10 {
++            [catch {exec ../../../src/redis-cli --cluster check $nodefrom(addr)} _] == 0
++        } else {
++            fail "Cluster could not settle with configuration"
++        }
++    }
++}
++
++reset_cluster
++
++test "Set key" {
++    # 'aga' key is in 609 slot
++    $cluster set aga xyz
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Fix doesn't need to fix anything" {
++    set code [catch {exec ../../../src/redis-cli --cluster fix $nodefrom(addr) << yes} result]
++    assert {$code == 0}
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Half init migration in 'migrating'" {
++    $nodefrom(link) cluster setslot 609 migrating $nodeto(id)
++}
++
++test "Fix cluster" {
++    fix_cluster
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Half init migration in 'importing'" {
++    $nodeto(link) cluster setslot 609 importing $nodefrom(id)
++}
++
++test "Fix cluster" {
++    fix_cluster
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Init migration and move key" {
++    $nodefrom(link) cluster setslot 609 migrating $nodeto(id)
++    $nodeto(link) cluster setslot 609 importing $nodefrom(id)
++    $nodefrom(link) migrate $nodeto(host) $nodeto(port) aga 0 10000
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Fix cluster" {
++    fix_cluster
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++reset_cluster
++
++test "Move key again" {
++    $nodefrom(link) cluster setslot 609 migrating $nodeto(id)
++    $nodeto(link) cluster setslot 609 importing $nodefrom(id)
++    $nodefrom(link) migrate $nodeto(host) $nodeto(port) aga 0 10000
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Half-finish migration" {
++    # half finish migration on 'migrating' node
++    $nodefrom(link) cluster setslot 609 node $nodeto(id)
++}
++
++test "Fix cluster" {
++    fix_cluster
++}
++
++reset_cluster
++
++test "Move key back" {
++    # 'aga' key is in 609 slot
++    $nodefrom(link) cluster setslot 609 migrating $nodeto(id)
++    $nodeto(link) cluster setslot 609 importing $nodefrom(id)
++    $nodefrom(link) migrate $nodeto(host) $nodeto(port) aga 0 10000
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
++
++test "Half-finish migration" {
++    # Now we half finish 'importing' node
++    $nodeto(link) cluster setslot 609 node $nodeto(id)
++}
++
++test "Fix cluster again" {
++    fix_cluster
++}
++
++test "Key is accessible" {
++    assert {[$cluster get aga] eq "xyz"}
++}
+diff --git a/tests/cluster/tests/15-fix-many-slot-migration.tcl b/tests/cluster/tests/15-fix-many-slot-migration.tcl
+new file mode 100644
+index 00000000..83c17099
+--- /dev/null
++++ b/tests/cluster/tests/15-fix-many-slot-migration.tcl
+@@ -0,0 +1,76 @@
++source "../tests/includes/init-tests.tcl"
++
++test "Create a 10 nodes cluster" {
++    create_cluster 10 10
++}
++
++test "Cluster is up" {
++    assert_cluster_state ok
++}
++
++set cluster [redis_cluster 127.0.0.1:[get_instance_attrib redis 0 port]]
++catch {unset nodefrom}
++catch {unset nodeto}
++proc reset_cluster {} {
++    uplevel 1 {
++        $cluster refresh_nodes_map
++    }
++}
++
++proc get_nodes {slot} {
++    uplevel 1 {
++        array set nodefrom [$cluster masternode_for_slot $slot]
++        array set nodeto [$cluster masternode_notfor_slot $slot]
++    }
++}
++
++proc fix_cluster {} {
++    uplevel 1 {
++        set code [catch {
++            exec ../../../src/redis-cli --cluster fix $nodefrom(addr) << yes
++        } result]
++        if {$code != 0 && $::verbose} {
++            puts $result
++        }
++        assert {$code == 0}
++        assert_cluster_state ok
++        wait_for_condition 1000 10 {
++            [catch {exec ../../../src/redis-cli --cluster check $nodefrom(addr)} _] == 0
++        } else {
++            fail "Cluster could not settle with configuration"
++        }
++    }
++}
++
++reset_cluster
++
++test "Set many keys" {
++    for {set i 0} {$i < 40000} {incr i} {
++        $cluster set key:$i val:$i
++    }
++}
++
++test "Keys are accessible" {
++    for {set i 0} {$i < 40000} {incr i} {
++        assert { [$cluster get key:$i] eq "val:$i" }
++    }
++}
++
++test "Init migration of many slots" {
++    for {set slot 0} {$slot < 1000} {incr slot} {
++        get_nodes $slot
++        $nodefrom(link) cluster setslot $slot migrating $nodeto(id)
++        $nodeto(link) cluster setslot $slot importing $nodefrom(id)
++    }
++}
++
++test "Fix cluster" {
++    fix_cluster
++}
++
++test "Keys are accessible" {
++    for {set i 0} {$i < 40000} {incr i} {
++        assert { [$cluster get key:$i] eq "val:$i" }
++    }
++}
++
+diff --git a/tests/instances.tcl b/tests/instances.tcl
+index 357b3481..d5d9af85 100644
+--- a/tests/instances.tcl
++++ b/tests/instances.tcl
+@@ -148,6 +148,8 @@ proc parse_options {} {
+             set ::simulate_error 1
+         } elseif {$opt eq {--valgrind}} {
+             set ::valgrind 1
++        } elseif {$opt eq {--verbose}} {
++            set ::verbose 1
+         } elseif {$opt eq "--help"} {
+             puts "Hello, I'm sentinel.tcl and I run Sentinel unit tests."
+             puts "\nOptions:"
+diff --git a/tests/support/cluster.tcl b/tests/support/cluster.tcl
+index 1576053b..9a49ca92 100644
+--- a/tests/support/cluster.tcl
++++ b/tests/support/cluster.tcl
+@@ -164,6 +164,28 @@ proc ::redis_cluster::__method__close {id} {
+     catch {interp alias {} ::redis_cluster::instance$id {}}
+ }
+ 
++proc ::redis_cluster::__method__masternode_for_slot {id slot} {
++    # Get the node mapped to this slot.
++    set node_addr [dict get $::redis_cluster::slots($id) $slot]
++    if {$node_addr eq {}} {
++        error "No mapped node for slot $slot."
++    }
++    return [dict get $::redis_cluster::nodes($id) $node_addr]
++}
++
++proc ::redis_cluster::__method__masternode_notfor_slot {id slot} {
++    # Get the node mapped to this slot.
++    set node_addr [dict get $::redis_cluster::slots($id) $slot]
++    set addrs [dict keys $::redis_cluster::nodes($id)]
++    foreach addr [lshuffle $addrs] {
++        set node [dict get $::redis_cluster::nodes($id) $addr]
++        if {$node_addr ne $addr && [dict get $node slaveof] eq "-"} {
++            return $node
++        }
++    }
++    error "Slot $slot is everywhere"
++}
++
+ proc ::redis_cluster::__dispatch__ {id method args} {
+     if {[info command ::redis_cluster::__method__$method] eq {}} {
+         # Get the keys from the command.
+@@ -186,10 +208,15 @@ proc ::redis_cluster::__dispatch__ {id method args} {
+ 
+         # Execute the command in the node we think is the slot owner.
+         set retry 100
++        set asking 0
+         while {[incr retry -1]} {
+             if {$retry < 5} {after 100}
+             set node [dict get $::redis_cluster::nodes($id) $node_addr]
+             set link [dict get $node link]
++            if {$asking} {
++                $link ASKING
++                set asking 0
++            }
+             if {[catch {$link $method {*}$args} e]} {
+                 if {$link eq {} || \
+                     [string range $e 0 4] eq {MOVED} || \
+@@ -202,6 +229,7 @@ proc ::redis_cluster::__dispatch__ {id method args} {
+                 } elseif {[string range $e 0 2] eq {ASK}} {
+                     # ASK redirection.
+                     set node_addr [lindex $e 2]
++                    set asking 1
+                     continue
+                 } else {
+                     # Non redirecting error.
+diff --git a/tests/support/util.tcl b/tests/support/util.tcl
+index 181c865f..0a2f7c33 100644
+--- a/tests/support/util.tcl
++++ b/tests/support/util.tcl
+@@ -378,16 +378,16 @@ proc stop_write_load {handle} {
+ 
+ proc K { x y } { set x } 
+ 
+-# Shuffle a list. From Tcl wiki. Originally from Steve Cohen that improved
+-# other versions. Code should be under public domain.
++# Shuffle a list with Fisher-Yates algorithm.
+ proc lshuffle {list} {
+     set n [llength $list]
+-    while {$n>0} {
++    while {$n>1} {
+         set j [expr {int(rand()*$n)}]
+-        lappend slist [lindex $list $j]
+         incr n -1
+-        set temp [lindex $list $n]
+-        set list [lreplace [K $list [set list {}]] $j $j $temp]
++        if {$n==$j} continue
++        set v [lindex $list $j]
++        lset list $j [lindex $list $n]
++        lset list $n $v
+     }
+-    return $slist
++    return $list
+ }

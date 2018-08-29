@@ -1,0 +1,13 @@
+Package: redis-tools-dbgsym
+Package-Type: ddeb
+Source: redis
+Version: 5:5.0-0joomcode1~bionic1
+Auto-Built-Package: debug-symbols
+Architecture: amd64
+Maintainer: Sokolov Yura <y.sokolov@joomcode.com>
+Installed-Size: 4536
+Depends: redis-tools (= 5:5.0-0joomcode1~bionic1)
+Section: debug
+Priority: optional
+Description: debug symbols for redis-tools
+Build-Ids: 65d7dc9968a971d37ad6ce5eacafec1ad935d9cc 891adfdc299dc26c444202d50cc945e609d35a10 9ce6684d5795faa7e3a73430292159a68fdb0eb8

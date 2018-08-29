@@ -1,0 +1,14 @@
+c9c0f0dcc3a8e0aaad613affc66ff063  usr/bin/redis-benchmark
+36685ac33a2f57b9a5ec03c73fca1fbe  usr/bin/redis-check-aof
+36685ac33a2f57b9a5ec03c73fca1fbe  usr/bin/redis-check-rdb
+b2a2186ca26ae7c9e28c69cb8da9491e  usr/bin/redis-cli
+848565df7f222dc03c8d5cb34b9e0188  usr/share/bash-completion/completions/bash_completion.d/redis-cli
+7918728575fbc0dcfe9c11922d1f13c1  usr/share/doc/redis-tools/changelog.Debian.gz
+dd086a37ddd39c842a9f1903daadf98e  usr/share/doc/redis-tools/changelog.gz
+6884a8609766598c538c11d3af2d044e  usr/share/doc/redis-tools/copyright
+7568ef814e33ce3f8238008f1a0070e6  usr/share/doc/redis-tools/examples/lru/README
+79c122b99170b29395e067f8919e9fec  usr/share/doc/redis-tools/examples/lru/lfu-simulation.c
+ade934cd52e1a0775f4680a91cdcad16  usr/share/doc/redis-tools/examples/lru/test-lru.rb
+bbfbabf2c26b18a89f47fb84d3ddd458  usr/share/doc/redis-tools/examples/redis-trib.rb
+bd1e139e18b7e72baf888dd841ab4b1f  usr/share/man/man1/redis-benchmark.1.gz
+a97c81de969b8cf08e2ffc85d558736b  usr/share/man/man1/redis-cli.1.gz
