@@ -1,0 +1,5 @@
+0001-5.0.3-fixes.patch
+0002-lua-ignore-oom.diff
+debian-packaging/0003-dpkg-buildflags.patch
+debian-packaging/0005-Skip-logging-tests-as-not-all-architectures-support-.patch
+debian-packaging/0006-Drop-tests-with-timing-issues.patch
