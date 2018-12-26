@@ -1529,7 +1529,7 @@ void clusterSetNodeAsMaster(clusterNode *n) {
  * case we receive the info via an UPDATE packet. */
 void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoch, unsigned char *slots) {
     int j;
-    clusterNode *curmaster, *newmaster = NULL;
+    clusterNode *curmaster = NULL, *newmaster = NULL;
     /* The dirty slots list is a list of slots for which we lose the ownership
      * while having still keys inside. This usually happens after a failover
      * or after a manual cluster reconfiguration operated by the admin.
@@ -1539,6 +1539,9 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
      * need to delete all the keys in the slots we lost ownership. */
     uint16_t dirty_slots[CLUSTER_SLOTS];
     int dirty_slots_count = 0;
+
+    int sender_slots = 0;
+    int migrated_our_slots = 0;
 
     /* Here we set curmaster to this node or the node this node
      * replicates to if it's a slave. In the for loop we are
@@ -1552,6 +1555,8 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
 
     for (j = 0; j < CLUSTER_SLOTS; j++) {
         if (bitmapTestBit(slots,j)) {
+            sender_slots++;
+
             /* The slot is already bound to the sender of this message. */
             if (server.cluster->slots[j] == sender) continue;
 
@@ -1578,8 +1583,10 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     dirty_slots_count++;
                 }
 
-                if (server.cluster->slots[j] == curmaster)
+                if (server.cluster->slots[j] == curmaster) {
                     newmaster = sender;
+                    migrated_our_slots++;
+                }
                 clusterDelSlot(j);
                 clusterAddSlot(sender,j);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
@@ -1602,7 +1609,9 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
      *    master.
      * 2) We are a slave and our master is left without slots. We need
      *    to replicate to the new slots owner. */
-    if (newmaster && curmaster->numslots == 0) {
+    if (newmaster && curmaster->numslots == 0 &&
+            (server.cluster_migrate_from_empty ||
+            sender_slots == migrated_our_slots)) {
         serverLog(LL_WARNING,
             "Configuration change detected. Reconfiguring myself "
             "as a replica of %.40s", sender->name);
