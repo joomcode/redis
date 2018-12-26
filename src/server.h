@@ -155,6 +155,7 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CONFIG_DEFAULT_LATENCY_MONITOR_THRESHOLD 0
 #define CONFIG_DEFAULT_SLAVE_LAZY_FLUSH 0
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION 0
+#define CONFIG_DEFAULT_LUA_IGNORE_OOM 0
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE 0
 #define CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL 0
 #define CONFIG_DEFAULT_ALWAYS_SHOW_LOGO 0
@@ -1260,6 +1261,7 @@ struct redisServer {
                              execution. */
     int lua_kill;         /* Kill the script if true. */
     int lua_always_replicate_commands; /* Default replication type. */
+    int lua_ignore_oom;   /* Ignore OOM for lua execution */
     /* Lazy free */
     int lazyfree_lazy_eviction;
     int lazyfree_lazy_expire;

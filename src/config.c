@@ -696,6 +696,8 @@ void loadServerConfigFromString(char *config) {
             server.lua_time_limit = strtoll(argv[1],NULL,10);
         } else if (!strcasecmp(argv[0],"lua-replicate-commands") && argc == 2) {
             server.lua_always_replicate_commands = yesnotoi(argv[1]);
+        } else if (!strcasecmp(argv[0],"lua-ignore-oom") && argc == 2) {
+            server.lua_ignore_oom = yesnotoi(argv[1]);
         } else if (!strcasecmp(argv[0],"slowlog-log-slower-than") &&
                    argc == 2)
         {
@@ -1129,6 +1131,8 @@ void configSetCommand(client *c) {
       "no-appendfsync-on-rewrite",server.aof_no_fsync_on_rewrite) {
     } config_set_bool_field(
       "dynamic-hz",server.dynamic_hz) {
+    } config_set_bool_field(
+      "lua-ignore-oom",server.lua_ignore_oom) {
 
     /* Numerical fields.
      * config_set_numerical_field(name,var,min,max) */
@@ -1467,6 +1471,8 @@ void configGetCommand(client *c) {
             server.repl_slave_lazy_flush);
     config_get_bool_field("dynamic-hz",
             server.dynamic_hz);
+    config_get_bool_field("lua-ignore-oom",
+            server.lua_ignore_oom);
 
     /* Enum values */
     config_get_enum_field("maxmemory-policy",
@@ -2215,6 +2221,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"aof-use-rdb-preamble",server.aof_use_rdb_preamble,CONFIG_DEFAULT_AOF_USE_RDB_PREAMBLE);
     rewriteConfigEnumOption(state,"supervised",server.supervised_mode,supervised_mode_enum,SUPERVISED_NONE);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-eviction",server.lazyfree_lazy_eviction,CONFIG_DEFAULT_LAZYFREE_LAZY_EVICTION);
+    rewriteConfigYesNoOption(state,"lua-ignore-oom",server.lua_ignore_oom,CONFIG_DEFAULT_LUA_IGNORE_OOM);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-expire",server.lazyfree_lazy_expire,CONFIG_DEFAULT_LAZYFREE_LAZY_EXPIRE);
     rewriteConfigYesNoOption(state,"lazyfree-lazy-server-del",server.lazyfree_lazy_server_del,CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL);
     rewriteConfigYesNoOption(state,"replica-lazy-flush",server.repl_slave_lazy_flush,CONFIG_DEFAULT_SLAVE_LAZY_FLUSH);

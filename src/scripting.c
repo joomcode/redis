@@ -513,12 +513,13 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
      * first write in the context of this script, otherwise we can't stop
      * in the middle. */
     if (server.maxmemory &&             /* Maxmemory is actually enabled. */
+        !server.lua_ignore_oom &&       /* And oom check is not disabled for lua */
         !server.loading &&              /* Don't care about mem if loading. */
         !server.masterhost &&           /* Slave must execute the script. */
         server.lua_write_dirty == 0 &&  /* Script had no side effects so far. */
         (cmd->flags & CMD_DENYOOM))
     {
-        if (getMaxmemoryState(NULL,NULL,NULL,NULL) != C_OK) {
+        if (!server.lua_ignore_oom && getMaxmemoryState(NULL,NULL,NULL,NULL) != C_OK) {
             luaPushError(lua, shared.oomerr->ptr);
             goto cleanup;
         }
