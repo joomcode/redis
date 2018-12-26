@@ -674,6 +674,14 @@ void loadServerConfigFromString(char *config) {
                 err = "cluster migration barrier must zero or positive";
                 goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"cluster-migrate-from-empty") &&
+                   argc == 2)
+        {
+            server.cluster_migrate_from_empty = yesnotoi(argv[1]);
+            if (server.cluster_migrate_from_empty == -1) {
+                err = "argument must be 'yes' or 'no'";
+                goto loaderr;
+            }
         } else if ((!strcasecmp(argv[0],"cluster-slave-validity-factor") ||
                     !strcasecmp(argv[0],"cluster-replica-validity-factor"))
                    && argc == 2)
@@ -1079,6 +1087,8 @@ void configSetCommand(client *c) {
     } config_set_bool_field(
       "cluster-replica-no-failover",server.cluster_slave_no_failover) {
     } config_set_bool_field(
+      "cluster-migrate-from-empty",server.cluster_migrate_from_empty) {
+    } config_set_bool_field(
       "aof-rewrite-incremental-fsync",server.aof_rewrite_incremental_fsync) {
     } config_set_bool_field(
       "rdb-save-incremental-fsync",server.rdb_save_incremental_fsync) {
@@ -1425,6 +1435,8 @@ void configGetCommand(client *c) {
             server.cluster_slave_no_failover);
     config_get_bool_field("cluster-replica-no-failover",
             server.cluster_slave_no_failover);
+    config_get_bool_field("cluster-migrate-from-empty",
+            server.cluster_migrate_from_empty);
     config_get_bool_field("no-appendfsync-on-rewrite",
             server.aof_no_fsync_on_rewrite);
     config_get_bool_field("slave-serve-stale-data",
@@ -2194,6 +2206,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"cluster-replica-no-failover",server.cluster_slave_no_failover,CLUSTER_DEFAULT_SLAVE_NO_FAILOVER);
     rewriteConfigNumericalOption(state,"cluster-node-timeout",server.cluster_node_timeout,CLUSTER_DEFAULT_NODE_TIMEOUT);
     rewriteConfigNumericalOption(state,"cluster-migration-barrier",server.cluster_migration_barrier,CLUSTER_DEFAULT_MIGRATION_BARRIER);
+    rewriteConfigYesNoOption(state,"cluster-migrate-from-empty",server.cluster_migrate_from_empty,CLUSTER_DEFAULT_MIGRATE_FROM_EMPTY);
     rewriteConfigNumericalOption(state,"cluster-replica-validity-factor",server.cluster_slave_validity_factor,CLUSTER_DEFAULT_SLAVE_VALIDITY);
     rewriteConfigNumericalOption(state,"slowlog-log-slower-than",server.slowlog_log_slower_than,CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN);
     rewriteConfigNumericalOption(state,"latency-monitor-threshold",server.latency_monitor_threshold,CONFIG_DEFAULT_LATENCY_MONITOR_THRESHOLD);
