@@ -1,3 +1,15 @@
+redis (5:5.0.5-2joomcode1~bionic1) bionic; urgency=high
+
+  * Fix runtime configuration for expire-lookups-per-loop
+
+ -- Sokolov Yura <y.sokolov@joomcode.com>  Fri, 13 Sep 2019 15:19:41 +0300
+
+redis (5:5.0.5-1joomcode1~bionic1) bionic; urgency=high
+
+  * Configurable expire-lookups-per-loop
+
+ -- Sokolov Yura <y.sokolov@joomcode.com>  Fri, 13 Sep 2019 14:39:41 +0300
+
 redis (5:5.0.5-0joomcode1~bionic1) bionic; urgency=high
 
   * Rebase on 5.0.5
