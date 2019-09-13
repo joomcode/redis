@@ -809,6 +809,12 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0], "expire-lookups-per-loop") && argc == 2) {
+            server.expire_lookups_per_loop = atoi(argv[1]);
+            if (server.expire_lookups_per_loop < 0) {
+                err = "expire-lookups-per-loop should be non-negative number";
+                goto loaderr;
+            }
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -1243,6 +1249,8 @@ void configSetCommand(client *c) {
     } config_set_numerical_field(
       "cluster-replica-validity-factor",server.cluster_slave_validity_factor,0,INT_MAX) {
     } config_set_numerical_field(
+      "expire-lookups-per-loop",server.expire_lookups_per_loop,5,1000) {
+    } config_set_numerical_field(
       "hz",server.config_hz,0,INT_MAX) {
         /* Hz is more an hint from the user, so we accept values out of range
          * but cap them to reasonable values. */
@@ -1427,6 +1435,7 @@ void configGetCommand(client *c) {
     config_get_numerical_field("cluster-replica-validity-factor",server.cluster_slave_validity_factor);
     config_get_numerical_field("repl-diskless-sync-delay",server.repl_diskless_sync_delay);
     config_get_numerical_field("tcp-keepalive",server.tcpkeepalive);
+    config_get_numerical_field("expire-lookups-per-loop",server.expire_lookups_per_loop);
 
     /* Bool (yes/no) values */
     config_get_bool_field("cluster-require-full-coverage",
@@ -2238,6 +2247,7 @@ int rewriteConfig(char *path) {
     rewriteConfigYesNoOption(state,"lazyfree-lazy-server-del",server.lazyfree_lazy_server_del,CONFIG_DEFAULT_LAZYFREE_LAZY_SERVER_DEL);
     rewriteConfigYesNoOption(state,"replica-lazy-flush",server.repl_slave_lazy_flush,CONFIG_DEFAULT_SLAVE_LAZY_FLUSH);
     rewriteConfigYesNoOption(state,"dynamic-hz",server.dynamic_hz,CONFIG_DEFAULT_DYNAMIC_HZ);
+    rewriteConfigNumericalOption(state,"expire-lookups-per-loop",server.expire_lookups_per_loop,ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP);
 
     /* Rewrite Sentinel config if in Sentinel mode. */
     if (server.sentinel_mode) rewriteConfigSentinelOption(state);
