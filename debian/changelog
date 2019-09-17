@@ -1,3 +1,9 @@
+redis (5:5.0.5-3joomcode1~bionic1) bionic; urgency=high
+
+  * Add expiration while eviction.
+
+ -- Sokolov Yura <y.sokolov@joomcode.com>  Tue, 17 Sep 2019 14:00:41 +0300
+
 redis (5:5.0.5-2joomcode1~bionic1) bionic; urgency=high
 
   * Fix runtime configuration for expire-lookups-per-loop
