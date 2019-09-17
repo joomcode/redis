@@ -533,6 +533,7 @@ int freeMemoryIfNeeded(void) {
                     }
                 }
                 if (!total_keys) break; /* No keys to evict. */
+                if (mem_freed + local_mem_freed > mem_tofree) break; /* evicted enough */
 
                 /* Go backward from best to worst element to evict. */
                 for (k = EVPOOL_SIZE-1; k >= 0; k--) {
