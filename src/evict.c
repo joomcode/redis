@@ -159,13 +159,19 @@ void evictionPoolAlloc(void) {
  * idle time are on the left, and keys with the higher idle time on the
  * right. */
 
-void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evictionPoolEntry *pool) {
+long long evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, dict *expdict, struct evictionPoolEntry *pool) {
     int j, k, count;
     dictEntry *samples[server.maxmemory_samples];
+    long long now;
+    long long mem_freed;
+
+    now = mstime();
+    mem_freed = 0;
 
     count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
     for (j = 0; j < count; j++) {
         unsigned long long idle;
+        long long ttl;
         sds key;
         robj *o;
         dictEntry *de;
@@ -177,7 +183,36 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
          * dictionary (but the expires one) we need to lookup the key
          * again in the key dictionary to obtain the value object. */
         if (server.maxmemory_policy != MAXMEMORY_VOLATILE_TTL) {
-            if (sampledict != keydict) de = dictFind(keydict, key);
+            ttl = now + 1;
+            if (sampledict != keydict) {
+                ttl = dictGetSignedIntegerVal(de);
+                de = dictFind(keydict, key);
+            } else {
+                dictEntry *expde;
+                expde = dictFind(expdict, key);
+                if (expde != NULL) {
+                    ttl = dictGetSignedIntegerVal(expde);
+                }
+            }
+            if (ttl < now) {
+                long long delta;
+                robj *keyobj = createStringObject(key,sdslen(key));
+                redisDb *db = server.db + dbid;
+
+                propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
+                delta = (long long) zmalloc_used_memory();
+                if (server.lazyfree_lazy_expire)
+                    dbAsyncDelete(db,keyobj);
+                else
+                    dbSyncDelete(db,keyobj);
+                notifyKeyspaceEvent(NOTIFY_EXPIRED,
+                    "expired",keyobj,dbid);
+                decrRefCount(keyobj);
+                server.stat_expiredkeys++;
+                delta -= (long long) zmalloc_used_memory();
+                mem_freed += delta;
+                continue;
+            }
             o = dictGetVal(de);
         }
 
@@ -254,6 +289,7 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
         pool[k].idle = idle;
         pool[k].dbid = dbid;
     }
+    return mem_freed;
 }
 
 /* ----------------------------------------------------------------------------
@@ -468,6 +504,7 @@ int freeMemoryIfNeeded(void) {
     latencyStartMonitor(latency);
     while (mem_freed < mem_tofree) {
         int j, k, i, keys_freed = 0;
+        long long local_mem_freed = 0;
         static unsigned int next_db = 0;
         sds bestkey = NULL;
         int bestdbid;
@@ -491,7 +528,7 @@ int freeMemoryIfNeeded(void) {
                     dict = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ?
                             db->dict : db->expires;
                     if ((keys = dictSize(dict)) != 0) {
-                        evictionPoolPopulate(i, dict, db->dict, pool);
+                        local_mem_freed += evictionPoolPopulate(i, dict, db->dict, db->expires, pool);
                         total_keys += keys;
                     }
                 }
@@ -572,7 +609,7 @@ int freeMemoryIfNeeded(void) {
             latencyAddSampleIfNeeded("eviction-del",eviction_latency);
             latencyRemoveNestedEvent(latency,eviction_latency);
             delta -= (long long) zmalloc_used_memory();
-            mem_freed += delta;
+            local_mem_freed += delta;
             server.stat_evictedkeys++;
             notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted",
                 keyobj, db->id);
@@ -600,7 +637,9 @@ int freeMemoryIfNeeded(void) {
             }
         }
 
-        if (!keys_freed) {
+        mem_freed += local_mem_freed;
+
+        if (!local_mem_freed) {
             latencyEndMonitor(latency);
             latencyAddSampleIfNeeded("eviction-cycle",latency);
             goto cant_free; /* nothing to free... */
