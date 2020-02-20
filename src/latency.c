@@ -371,6 +371,11 @@ sds createLatencyReport(void) {
             advices++;
         }
 
+        if (!strcasecmp(event,"expire-del")) {
+            advise_large_objects = 1;
+            advices++;
+        }
+
         if (!strcasecmp(event,"eviction-cycle")) {
             advise_mass_eviction = 1;
             advices++;

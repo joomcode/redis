@@ -449,9 +449,11 @@ int freeMemoryIfNeeded(void) {
     if (server.masterhost && server.repl_slave_ignore_maxmemory) return C_OK;
 
     size_t mem_reported, mem_tofree, mem_freed;
-    mstime_t latency, eviction_latency;
+    mstime_t latency, eviction_latency, expire_latency;
     long long delta;
     int slaves = listLength(server.slaves);
+    int keys_freed = 0;
+    long long now = mstime();
 
     /* When clients are paused the dataset should be static not just from the
      * POV of clients not being able to write, but also from the POV of
@@ -467,7 +469,7 @@ int freeMemoryIfNeeded(void) {
 
     latencyStartMonitor(latency);
     while (mem_freed < mem_tofree) {
-        int j, k, i, keys_freed = 0;
+        int j, k, i, now_freed = 0;
         static unsigned int next_db = 0;
         sds bestkey = NULL;
         int bestdbid;
@@ -500,14 +502,37 @@ int freeMemoryIfNeeded(void) {
                 /* Go backward from best to worst element to evict. */
                 for (k = EVPOOL_SIZE-1; k >= 0; k--) {
                     if (pool[k].key == NULL) continue;
+                    sds key = pool[k].key;
                     bestdbid = pool[k].dbid;
 
-                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        de = dictFind(server.db[pool[k].dbid].dict,
-                            pool[k].key);
-                    } else {
-                        de = dictFind(server.db[pool[k].dbid].expires,
-                            pool[k].key);
+                    /* check expiration of an entry */
+                    de = dictFind(server.db[pool[k].dbid].expires, key);
+                    if (de != NULL && dictGetSignedIntegerVal(de) < now) {
+                        robj *keyobj = createStringObject(key,sdslen(key));
+                        redisDb *db = server.db + pool[k].dbid;
+
+                        delta = (long long) zmalloc_used_memory();
+                        latencyStartMonitor(expire_latency);
+                        propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
+                        if (server.lazyfree_lazy_expire)
+                            dbAsyncDelete(db,keyobj);
+                        else
+                            dbSyncDelete(db,keyobj);
+                        latencyEndMonitor(expire_latency);
+                        latencyAddSampleIfNeeded("expire-del",expire_latency);
+                        latencyRemoveNestedEvent(latency,expire_latency);
+                        delta -= (long long) zmalloc_used_memory();
+                        mem_freed += delta;
+                        keys_freed++;
+                        now_freed++;
+                        notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired",
+                            keyobj, pool[k].dbid);
+                        decrRefCount(keyobj);
+                        server.stat_expiredkeys++;
+                        /* ignore deleted key */
+                        de = NULL;
+                    } else if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                        de = dictFind(server.db[pool[k].dbid].dict, key);
                     }
 
                     /* Remove the entry from the pool. */
@@ -578,6 +603,7 @@ int freeMemoryIfNeeded(void) {
                 keyobj, db->id);
             decrRefCount(keyobj);
             keys_freed++;
+            now_freed++;
 
             /* When the memory to free starts to be big enough, we may
              * start spending so much time here that is impossible to
@@ -600,7 +626,7 @@ int freeMemoryIfNeeded(void) {
             }
         }
 
-        if (!keys_freed) {
+        if (!now_freed) {
             latencyEndMonitor(latency);
             latencyAddSampleIfNeeded("eviction-cycle",latency);
             goto cant_free; /* nothing to free... */
