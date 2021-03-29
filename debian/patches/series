@@ -1,0 +1,5 @@
+0001-fix-ftbfs-on-kfreebsd.patch
+debian-packaging/0003-dpkg-buildflags.patch
+debian-packaging/0007-Set-Debian-configuration-defaults.patch
+0010-Use-get_current_dir_name-over-PATHMAX-etc.patch
+0009-Send-the-readiness-notification-when-we-are-ready-to.patch

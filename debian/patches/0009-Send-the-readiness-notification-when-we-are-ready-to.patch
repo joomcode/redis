@@ -1,0 +1,71 @@
+From: Guillem Jover <gjover@sipwise.com>
+Date: Tue, 19 Jan 2021 00:34:59 +0100
+Subject: Send the readiness notification when we are ready to accept
+ connections
+
+On a replica we do accept connections, even though commands accessing
+the database will operate in read-only mode. But the server is still
+already operational and processing commands.
+
+Not sending the readiness notification means that on a HA setup where
+the nodes all start as replicas (with replicaof in the config) with
+a replica that cannot connect to the master server and which might not
+come back in a predictable amount of time or at all, the service
+supervisor will end up timing out the service and terminating it, with
+no option to promote it to be the main instance. This seems counter to
+what the readiness notification is supposed to be signaling.
+
+Instead send the readiness notification when we start accepting
+commands, and then send the various server status changes as that.
+
+Fixes: commit 641c64ada10404356fc76c0b56a69b32c76f253c
+Fixes: commit dfb598cf3304818e608ceb6b5d9529a293345c4a
+
+Ref: Debian:#981226
+Ref: <https://github.com/redis/redis/pull/8409>
+---
+ src/replication.c | 6 ++----
+ src/server.c      | 4 ++--
+ 2 files changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/src/replication.c b/src/replication.c
+index 5ce9f02..c408219 100644
+--- a/src/replication.c
++++ b/src/replication.c
+@@ -1873,8 +1873,7 @@ void readSyncBulkPayload(connection *conn) {
+     serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Finished with success");
+ 
+     if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+-        redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Finished with success. Ready to accept connections.\n");
+-        redisCommunicateSystemd("READY=1\n");
++        redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Finished with success. Ready to accept connections in read-write mode.\n");
+     }
+ 
+    /* Send the initial ACK immediately to put this replica in online state. */
+@@ -2434,8 +2433,7 @@ void syncWithMaster(connection *conn) {
+     if (psync_result == PSYNC_CONTINUE) {
+         serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Master accepted a Partial Resynchronization.");
+         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+-            redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Partial Resynchronization accepted. Ready to accept connections.\n");
+-            redisCommunicateSystemd("READY=1\n");
++            redisCommunicateSystemd("STATUS=MASTER <-> REPLICA sync: Partial Resynchronization accepted. Ready to accept connections in read-write mode.\n");
+         }
+         return;
+     }
+diff --git a/src/server.c b/src/server.c
+index 2cabb2e..5f27b09 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -6251,10 +6251,10 @@ int main(int argc, char **argv) {
+         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
+             if (!server.masterhost) {
+                 redisCommunicateSystemd("STATUS=Ready to accept connections\n");
+-                redisCommunicateSystemd("READY=1\n");
+             } else {
+-                redisCommunicateSystemd("STATUS=Waiting for MASTER <-> REPLICA sync\n");
++                redisCommunicateSystemd("STATUS=Ready to accept connections in read-only mode. Waiting for MASTER <-> REPLICA sync\n");
+             }
++            redisCommunicateSystemd("READY=1\n");
+         }
+     } else {
+         ACLLoadUsersAtStartup();

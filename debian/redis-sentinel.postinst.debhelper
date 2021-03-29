@@ -1,0 +1,22 @@
+# Automatically added by dh_installinit
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
+	if [ -x "/etc/init.d/redis-sentinel" ]; then
+		update-rc.d redis-sentinel defaults >/dev/null
+	fi
+	if [ -x "/etc/init.d/redis-sentinel" ] || [ -e "/etc/init/redis-sentinel.conf" ]; then
+		invoke-rc.d redis-sentinel start || exit $?
+	fi
+fi
+# End automatically added section
+# Automatically added by dh_installdeb
+dpkg-maintscript-helper rm_conffile /etc/redis/redis-sentinel.post-down.d/00_example 4:4.0.2-3~ -- "$@"
+# End automatically added section
+# Automatically added by dh_installdeb
+dpkg-maintscript-helper rm_conffile /etc/redis/redis-sentinel.post-up.d/00_example 4:4.0.2-3~ -- "$@"
+# End automatically added section
+# Automatically added by dh_installdeb
+dpkg-maintscript-helper rm_conffile /etc/redis/redis-sentinel.pre-down.d/00_example 4:4.0.2-3~ -- "$@"
+# End automatically added section
+# Automatically added by dh_installdeb
+dpkg-maintscript-helper rm_conffile /etc/redis/redis-sentinel.pre-up.d/00_example 4:4.0.2-3~ -- "$@"
+# End automatically added section
